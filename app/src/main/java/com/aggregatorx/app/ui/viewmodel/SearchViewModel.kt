@@ -60,6 +60,7 @@ class SearchViewModel @Inject constructor(
     private val sessionSeenUrls = mutableSetOf<String>()
     private val videoPreviewCache = java.util.concurrent.ConcurrentHashMap<String, VideoPreviewResult>()
     private var currentSearchJob: Job? = null
+    private var lastSearchQuery = ""
 
     init {
         viewModelScope.launch {
@@ -72,6 +73,18 @@ class SearchViewModel @Inject constructor(
 
     // ── SEARCH & DISCOVERY ──────────────────────────────────────────────
 
+    /**
+     * Execute search with fresh results guarantee.
+     * 
+     * FRESH RESULTS BEHAVIOR:
+     * - isLoadMore=false: New query detected -> clears all caches, resets pagination, forces fresh scrape
+     * - isLoadMore=true: Load more for current query -> fetches next page while maintaining deduplication
+     * 
+     * PAGINATION:
+     * - First loop: Page 0 from each provider (as if typing on their site)
+     * - Pagination buttons increment page number for that provider
+     * - Each page is fetched fresh from the provider
+     */
     fun search(isLoadMore: Boolean = false) {
         val query = _uiState.value.query.trim()
         if (query.isEmpty() || _isDiscoveryPaused.value) return
@@ -79,7 +92,12 @@ class SearchViewModel @Inject constructor(
         currentSearchJob?.cancel()
 
         currentSearchJob = viewModelScope.launch {
-            if (!isLoadMore) {
+            // Detect if this is a new query (fresh search) vs load more
+            val isNewQuery = query != lastSearchQuery
+            lastSearchQuery = query
+
+            if (!isLoadMore || isNewQuery) {
+                // NEW SEARCH: Clear everything and start fresh
                 sessionSeenUrls.clear()
                 repository.clearSearchCache()
                 videoPreviewCache.clear()
@@ -92,11 +110,16 @@ class SearchViewModel @Inject constructor(
             _uiState.update { it.copy(isSearching = true, currentSearchQuery = query, error = null) }
             val currentResults = if (isLoadMore) _providerResults.value.toMutableList() else mutableListOf()
 
-            // Calls Repository using the new pages parameter fix
-            repository.searchAllProviders(query, pages = _providerPages.value)
+            // Search all enabled providers with current pagination state
+            // forceRefresh=true ensures fresh results on new search, false allows cache on pagination
+            repository.searchAllProviders(
+                query = query,
+                pages = _providerPages.value,
+                forceRefresh = isNewQuery
+            )
                 .catch { e -> if (currentResults.isEmpty()) _uiState.update { it.copy(error = e.message) } }
                 .collect { providerResult ->
-                    // Session-level de-duplication
+                    // Session-level de-duplication: only keep URLs we haven't seen this session
                     val uniqueNewOnes = providerResult.results.filter { sessionSeenUrls.add(it.url) }
                     
                     if (uniqueNewOnes.isNotEmpty()) {
@@ -118,7 +141,7 @@ class SearchViewModel @Inject constructor(
 
             _uiState.update { it.copy(isSearching = false, searchCompleted = true) }
 
-            // PASS 2: Preference Ranking (AI Tab)
+            // PASS 2: Preference Ranking (AI Tab) - learned from user's liked results
             launch {
                 val likedDomains = _likedUrls.value.mapNotNull { 
                     try { java.net.URI(it).host } catch (_: Exception) { null } 
@@ -135,7 +158,7 @@ class SearchViewModel @Inject constructor(
                 _myAiResults.value = aiRanked.take(50)
             }
 
-            // PASS 3: Related discovery (Token Tab)
+            // PASS 3: Related discovery (Token Tab) - automated token discovery and replay
             launch {
                 val tokensFound = mutableListOf<SearchResult>()
                 currentResults.filter { it.success }.forEach { p ->
@@ -161,6 +184,10 @@ class SearchViewModel @Inject constructor(
 
     // ── PAGINATION & CONTROLS ──────────────────────────────────────────
 
+    /**
+     * Load next page for a specific provider.
+     * Increments page number and performs load more search with pagination state.
+     */
     fun nextProviderPage(providerId: String) {
         _providerPages.update { pages ->
             val current = pages[providerId] ?: 0
@@ -201,6 +228,7 @@ class SearchViewModel @Inject constructor(
         _providerResults.value = emptyList()
         sessionSeenUrls.clear()
         videoPreviewCache.clear()
+        lastSearchQuery = ""
     }
 
     // ── VIDEO EXTRACTION CHAIN ──────────────────────────────────────────

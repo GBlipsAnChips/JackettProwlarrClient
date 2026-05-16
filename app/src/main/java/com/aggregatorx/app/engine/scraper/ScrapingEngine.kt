@@ -35,6 +35,7 @@ import kotlin.math.max
  * - Smart Navigation to bypass category/genre landing pages
  * - AI Learning integration for adaptive strategy selection
  * - Multi-layer bypass (Standard -> Cloudflare Bypass -> Headless)
+ * - FRESH RESULTS: Respects useCache flag and never returns stale results on demand
  */
 @Singleton
 class ScrapingEngine @Inject constructor(
@@ -101,13 +102,26 @@ class ScrapingEngine @Inject constructor(
 
     /**
      * Search across all enabled providers concurrently.
-     * Guaranteed to process every provider; failures are caught and reported individually.
+     * 
+     * FRESH RESULTS GUARANTEE:
+     * - When useCache=false, always performs fresh scraping (no stale results)
+     * - When useCache=true, checks cache TTL before returning cached results
+     * - Pagination state (pages map) is respected for each provider
+     * 
+     * @param query The search query
+     * @param useCache If false, bypasses all caching and always scrapes fresh
+     * @param pages Map of providerId -> pageNumber for pagination support
      */
-    fun searchAllProviders(query: String, cache: Boolean = cacheResults): Flow<ProviderSearchResults> = flow {
+    fun searchAllProviders(
+        query: String, 
+        useCache: Boolean = cacheResults,
+        pages: Map<String, Int> = emptyMap()
+    ): Flow<ProviderSearchResults> = flow {
         val processedQuery = nlpProcessor.processQuery(query)
         currentProcessedQuery = processedQuery
 
-        if (cache) {
+        // Check cache only if explicitly enabled
+        if (useCache) {
             val cachedEntry = synchronized(resultCache) { resultCache[query] }
             if (cachedEntry != null && System.currentTimeMillis() - cachedEntry.timestamp < CACHE_TTL_MS) {
                 cachedEntry.results.forEach { emit(it) }
@@ -135,7 +149,7 @@ class ScrapingEngine @Inject constructor(
                         processedProviders.add(provider.id)
                         try {
                             withTimeoutOrNull(perProviderTimeoutMs) {
-                                safeSearchProvider(provider, query)
+                                safeSearchProvider(provider, query, pages[provider.id] ?: 0)
                             } ?: ProviderSearchResults(
                                 provider = provider,
                                 results = emptyList(),
@@ -180,12 +194,13 @@ class ScrapingEngine @Inject constructor(
             }
         }
 
-        if (cache && results.any { it.success }) {
+        // Cache results only if caching is enabled AND we got successful results
+        if (useCache && results.any { it.success }) {
             synchronized(resultCache) { resultCache[query] = CacheEntry(results) }
         }
     }.flowOn(Dispatchers.IO)
 
-    private suspend fun safeSearchProvider(provider: Provider, query: String): ProviderSearchResults {
+    private suspend fun safeSearchProvider(provider: Provider, query: String, pageNum: Int = 0): ProviderSearchResults {
         val startTime = System.currentTimeMillis()
         val domain = extractDomain(provider.baseUrl)
         
@@ -194,41 +209,41 @@ class ScrapingEngine @Inject constructor(
         
         return try {
             if (isCoolingDown) {
-                val fallback = tryFallbackScraping(provider, query, startTime, Exception("Cooldown"))
+                val fallback = tryFallbackScraping(provider, query, startTime, Exception("Cooldown"), pageNum)
                 if (fallback.success && fallback.results.isNotEmpty()) {
                     val validated = validateAndFilterResults(fallback.results, query)
                     if (validated.isNotEmpty()) return fallback.copy(results = validated)
                 }
-                retryWithNlpQueries(provider, query, startTime) ?: fallback
+                retryWithNlpQueries(provider, query, startTime, pageNum) ?: fallback
             } else {
-                val result = searchProviderSmart(provider, query)
+                val result = searchProviderSmart(provider, query, pageNum)
                 if (result.success && result.results.isNotEmpty()) {
                     val validated = validateAndFilterResults(result.results, query)
                     if (validated.isEmpty()) {
                         aiDecisionEngine.learnFromFailure(domain, "CATEGORY_PAGE", "Invalid results", ScrapingStrategy.HTML_PARSING, null, provider.baseUrl)
-                        retryWithNlpQueries(provider, query, startTime) ?: result.copy(results = emptyList(), success = false, errorMessage = "Category results filtered")
+                        retryWithNlpQueries(provider, query, startTime, pageNum) ?: result.copy(results = emptyList(), success = false, errorMessage = "Category results filtered")
                     } else {
                         aiDecisionEngine.learnFromSuccess(domain, ScrapingStrategy.HTML_PARSING, null, null, null, validated.size, System.currentTimeMillis() - startTime)
                         result.copy(results = validated)
                     }
                 } else {
-                    retryWithNlpQueries(provider, query, startTime) ?: result
+                    retryWithNlpQueries(provider, query, startTime, pageNum) ?: result
                 }
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             aiDecisionEngine.learnFromFailure(domain, "EXCEPTION", e.message, ScrapingStrategy.HTML_PARSING, null, provider.baseUrl)
-            val fallback = tryFallbackScraping(provider, query, startTime, e)
+            val fallback = tryFallbackScraping(provider, query, startTime, e, pageNum)
             if (fallback.success && fallback.results.isNotEmpty()) {
                 val validated = validateAndFilterResults(fallback.results, query)
                 if (validated.isNotEmpty()) return fallback.copy(results = validated)
             }
-            retryWithNlpQueries(provider, query, startTime) ?: fallback
+            retryWithNlpQueries(provider, query, startTime, pageNum) ?: fallback
         }
     }
 
-    private suspend fun retryWithNlpQueries(provider: Provider, originalQuery: String, startTime: Long): ProviderSearchResults? {
+    private suspend fun retryWithNlpQueries(provider: Provider, originalQuery: String, startTime: Long, pageNum: Int = 0): ProviderSearchResults? {
         val processed = currentProcessedQuery ?: return null
         val variants = processed.searchQueries.filter { it.lowercase() != originalQuery.lowercase() }.take(3)
         if (variants.isEmpty()) return null
@@ -238,7 +253,7 @@ class ScrapingEngine @Inject constructor(
 
         for (variant in variants) {
             try {
-                val result = searchProviderSmart(provider, variant)
+                val result = searchProviderSmart(provider, variant, pageNum)
                 if (result.success) {
                     val validated = validateAndFilterResults(result.results, originalQuery)
                     validated.forEach { if (seenUrls.add(it.url)) allResults.add(it) }
@@ -276,7 +291,7 @@ class ScrapingEngine @Inject constructor(
         }
     }
 
-    suspend fun searchProviderSmart(provider: Provider, query: String): ProviderSearchResults {
+    suspend fun searchProviderSmart(provider: Provider, query: String, pageNum: Int = 0): ProviderSearchResults {
         val startTime = System.currentTimeMillis()
         val processed = currentProcessedQuery
         val effectiveQuery = if (processed != null && processed.isNaturalLanguage && query == processed.originalQuery) {
@@ -290,7 +305,7 @@ class ScrapingEngine @Inject constructor(
             // 1. Search URL Discovery
             val smartSearchUrl = smartNavigationEngine.findSearchUrl(provider.baseUrl, effectiveQuery)
             if (smartSearchUrl != null) {
-                val results = scrapeWithSmartNavigation(provider, query, smartSearchUrl)
+                val results = scrapeWithSmartNavigation(provider, query, smartSearchUrl, pageNum)
                 if (results.isNotEmpty()) {
                     updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
                     return ProviderSearchResults(provider, results, System.currentTimeMillis() - startTime, true)
@@ -298,27 +313,28 @@ class ScrapingEngine @Inject constructor(
             }
 
             // 2. Tab Crawling (for sites without search)
-            val tabResults = scrapeWithTabCrawl(provider, effectiveQuery)
+            val tabResults = scrapeWithTabCrawl(provider, effectiveQuery, pageNum)
             if (tabResults.isNotEmpty()) {
                 updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
                 return ProviderSearchResults(provider, tabResults, System.currentTimeMillis() - startTime, true)
             }
 
             // 3. Fallback to generic search
-            searchProvider(provider, effectiveQuery)
+            searchProvider(provider, effectiveQuery, pageNum)
         } catch (e: Exception) {
-            searchProvider(provider, effectiveQuery)
+            searchProvider(provider, effectiveQuery, pageNum)
         }
     }
 
-    private suspend fun scrapeWithSmartNavigation(provider: Provider, query: String, searchUrl: String): List<SearchResult> = withContext(Dispatchers.IO) {
-        val document = fetchDocument(searchUrl)
-        val (activeUrl, activeDoc) = if (smartNavigationEngine.isCategoryPage(searchUrl, document)) {
-            smartNavigationEngine.navigatePastCategory(provider.baseUrl, document, query) ?: (searchUrl to document)
-        } else searchUrl to document
+    private suspend fun scrapeWithSmartNavigation(provider: Provider, query: String, searchUrl: String, pageNum: Int = 0): List<SearchResult> = withContext(Dispatchers.IO) {
+        val paginatedUrl = if (pageNum > 0) "$searchUrl&page=$pageNum" else searchUrl
+        val document = fetchDocument(paginatedUrl)
+        val (activeUrl, activeDoc) = if (smartNavigationEngine.isCategoryPage(paginatedUrl, document)) {
+            smartNavigationEngine.navigatePastCategory(provider.baseUrl, document, query) ?: (paginatedUrl to document)
+        } else paginatedUrl to document
 
         val results = extractResultsWithThumbnails(activeDoc, provider, query)
-        if (results.size < 10) {
+        if (results.size < 10 && pageNum == 0) {  // Only get pagination links on first page
             val pages = smartNavigationEngine.getPaginationLinks(activeDoc, provider.baseUrl, 2)
             val combined = results.toMutableList()
             pages.forEach { url ->
@@ -343,7 +359,7 @@ class ScrapingEngine @Inject constructor(
             val result = SearchResult(
                 title = title,
                 url = link.url,
-                thumbnailUrl = link.thumbnail, // Fix: Use correct field
+                thumbnailUrl = link.thumbnail,
                 description = findDescriptionInDocument(document, link.url),
                 providerId = provider.id,
                 providerName = provider.name,
@@ -418,7 +434,7 @@ class ScrapingEngine @Inject constructor(
     /**
      * Standard provider search using stored configs or analysis
      */
-    suspend fun searchProvider(provider: Provider, query: String): ProviderSearchResults {
+    suspend fun searchProvider(provider: Provider, query: String, pageNum: Int = 0): ProviderSearchResults {
         val startTime = System.currentTimeMillis()
         return try {
             enforceRateLimit(provider.id)
@@ -428,23 +444,23 @@ class ScrapingEngine @Inject constructor(
             val analysis = siteAnalysisDao.getLatestAnalysis(provider.id)
             
             val results = when {
-                config != null -> scrapeWithConfig(provider, query, config)
-                analysis != null -> scrapeWithAnalysis(provider, query, analysis)
-                else -> scrapeGeneric(provider, query)
+                config != null -> scrapeWithConfig(provider, query, config, pageNum)
+                analysis != null -> scrapeWithAnalysis(provider, query, analysis, pageNum)
+                else -> scrapeGeneric(provider, query, pageNum)
             }
             
             updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
             ProviderSearchResults(provider, results, System.currentTimeMillis() - startTime, true)
         } catch (e: Exception) {
-            tryFallbackScraping(provider, query, startTime, e)
+            tryFallbackScraping(provider, query, startTime, e, pageNum)
         }
     }
 
-    private suspend fun tryFallbackScraping(provider: Provider, query: String, start: Long, e: Exception): ProviderSearchResults {
+    private suspend fun tryFallbackScraping(provider: Provider, query: String, start: Long, e: Exception, pageNum: Int = 0): ProviderSearchResults {
         providerDao.incrementFailedCount(provider.id)
         val methods: List<suspend () -> List<SearchResult>> = listOf(
-            { scrapeGeneric(provider, query) },
-            { scrapeWithTabCrawl(provider, query) },
+            { scrapeGeneric(provider, query, pageNum) },
+            { scrapeWithTabCrawl(provider, query, pageNum) },
             { scrapeProviderHomepage(provider, query) }
         )
 
@@ -463,8 +479,8 @@ class ScrapingEngine @Inject constructor(
 
     // --- Helper Scrapers & Logic ---
 
-    private suspend fun scrapeWithConfig(p: Provider, q: String, c: ScrapingConfig): List<SearchResult> = withContext(Dispatchers.IO) {
-        val url = c.searchUrlTemplate.replace("{baseUrl}", p.baseUrl).replace("{query}", URLEncoder.encode(q, c.encoding))
+    private suspend fun scrapeWithConfig(p: Provider, q: String, c: ScrapingConfig, pageNum: Int = 0): List<SearchResult> = withContext(Dispatchers.IO) {
+        val url = c.searchUrlTemplate.replace("{baseUrl}", p.baseUrl).replace("{query}", URLEncoder.encode(q, c.encoding)).replace("{page}", (pageNum + 1).toString())
         val doc = fetchDocument(url, c)
         extractResultsWithConfig(doc, p, q, c)
     }
@@ -479,8 +495,9 @@ class ScrapingEngine @Inject constructor(
         }
     }
 
-    private suspend fun scrapeWithAnalysis(p: Provider, q: String, a: SiteAnalysis): List<SearchResult> = withContext(Dispatchers.IO) {
-        val url = "${p.baseUrl}/search?q=${URLEncoder.encode(q, "UTF-8")}"
+    private suspend fun scrapeWithAnalysis(p: Provider, q: String, a: SiteAnalysis, pageNum: Int = 0): List<SearchResult> = withContext(Dispatchers.IO) {
+        val pageParam = if (pageNum > 0) "&page=$pageNum" else ""
+        val url = "${p.baseUrl}/search?q=${URLEncoder.encode(q, "UTF-8")}$pageParam"
         val doc = fetchDocument(url)
         val selector = a.resultItemSelector ?: detectResultItemSelector(doc) ?: return@withContext emptyList()
         doc.select(selector).mapNotNull { item ->
@@ -490,9 +507,10 @@ class ScrapingEngine @Inject constructor(
         }
     }
 
-    private suspend fun scrapeGeneric(p: Provider, q: String): List<SearchResult> = withContext(Dispatchers.IO) {
+    private suspend fun scrapeGeneric(p: Provider, q: String, pageNum: Int = 0): List<SearchResult> = withContext(Dispatchers.IO) {
         val enc = URLEncoder.encode(q, "UTF-8")
-        val patterns = listOf("${p.baseUrl}/search?q=$enc", "${p.baseUrl}/?s=$enc", "${p.baseUrl}/search/$enc")
+        val pageParam = if (pageNum > 0) "?page=$pageNum" else ""
+        val patterns = listOf("${p.baseUrl}/search?q=$enc$pageParam", "${p.baseUrl}/?s=$enc$pageParam", "${p.baseUrl}/search/$enc$pageParam")
         for (url in patterns) {
             try {
                 val doc = fetchDocument(url)
@@ -513,9 +531,9 @@ class ScrapingEngine @Inject constructor(
         }
     }
 
-    private suspend fun scrapeWithTabCrawl(p: Provider, q: String): List<SearchResult> {
-        val links = smartNavigationEngine.crawlCategoryTabsForQuery(p.baseUrl, q, 5)
-        return links.map { 
+    private suspend fun scrapeWithTabCrawl(p: Provider, q: String, pageNum: Int = 0): List<SearchResult> {
+        val links = smartNavigationEngine.crawlCategoryTabsForQuery(p.baseUrl, q, 5 + (pageNum * 5))
+        return links.drop(pageNum * 5).take(5).map { 
             SearchResult(p.id, p.name, it.title, it.url, null, it.thumbnail, relevanceScore = calculateRelevanceScore(it.title, q))
         }
     }
@@ -546,7 +564,7 @@ class ScrapingEngine @Inject constructor(
     private fun extractUrl(el: Element, sel: String, base: String): String = normalizeUrl(el.select(sel).attr("href"), base)
     private fun extractImageUrl(el: Element, sel: String, base: String): String = normalizeUrl(el.select(sel).attr("src"), base)
     private fun extractTitleFromUrl(url: String): String? = try { url.substringAfterLast("/").replace("-", " ").replace("_", " ").capitalize() } catch (_: Exception) { null }
-    private fun findDescriptionInDocument(doc: Document, url: String): String? = null // Simplified for brevity
+    private fun findDescriptionInDocument(doc: Document, url: String): String? = null
     private fun normalizeUrl(url: String, base: String): String = EngineUtils.normalizeUrl(url, base)
     private fun extractDomain(url: String): String = EngineUtils.extractDomain(url)
     private fun getRandomUserAgent(): String = EngineUtils.getRandomUserAgent()

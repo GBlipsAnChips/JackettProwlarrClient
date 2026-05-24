@@ -23,7 +23,7 @@ class JavaScriptWebViewEngine(private val existingWebView: WebView? = null) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // ── Core load ─────────────────────────────────────────────────────────────
+    // ── Core load ─────────────────────────────────────────────────────────
 
     /**
      * Load [url], wait for JS to settle, return full rendered HTML.
@@ -95,65 +95,45 @@ class JavaScriptWebViewEngine(private val existingWebView: WebView? = null) {
                 }
                 cont.invokeOnCancellation { done("") }
 
-            val js = """
-            (function() {
-                const searchInput = document.querySelector('$searchSelector');
-                if (searchInput) {
-                    searchInput.value = '$query';
-                    searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-                    searchInput.dispatchEvent(new Event('change', { bubbles: true }));
-                }
-                const submitBtn = document.querySelector('$submitSelector');
-                if (submitBtn) {
-                    submitBtn.click();
-                }
-            })();
-            """.trimIndent()
+                val js = """
+                (function() {
+                    const searchInput = document.querySelector('$searchSelector');
+                    if (searchInput) {
+                        searchInput.value = '$query';
+                        searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+                        searchInput.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                    const submitBtn = document.querySelector('$submitSelector');
+                    if (submitBtn) {
+                        submitBtn.click();
+                    }
+                })();
+                """.trimIndent()
 
-            webView.evaluateJavascript(js, null)
+                wv.evaluateJavascript(js, null)
 
-            val startTime = System.currentTimeMillis()
-            var checkRunnable: Runnable? = null
-            
-            checkRunnable = Runnable {
-                webView.evaluateJavascript(
-                    "(function() { return document.querySelectorAll('$resultSelector').length > 0; })();"
-                ) { result ->
-                    val found = result?.contains("true") ?: false
-                    if (found || (System.currentTimeMillis() - startTime) >= (timeoutMs - 1000)) {
-                        webView.evaluateJavascript("document.documentElement.outerHTML") { finalHtml ->
-                            val html = finalHtml?.trim('"')?.replace("\\\"", "\"") ?: ""
-                            safeResume(html)
+                val startTime = System.currentTimeMillis()
+                var checkRunnable: Runnable? = null
+                
+                checkRunnable = Runnable {
+                    wv.evaluateJavascript(
+                        "(function() { return document.querySelectorAll('$resultSelector').length > 0; })();"
+                    ) { result ->
+                        val found = result?.contains("true") ?: false
+                        if (found || (System.currentTimeMillis() - startTime) >= (timeoutMs - 1000)) {
+                            wv.evaluateJavascript("document.documentElement.outerHTML") { finalHtml ->
+                                val html = finalHtml?.trim('"')?.replace("\\\"", "\"") ?: ""
+                                done(html)
+                            }
+                        } else {
+                            wv.postDelayed(checkRunnable!!, 1_500)
                         }
                     }
                 }
-                wv.postDelayed(check, 1_500)
+                wv.postDelayed(checkRunnable!!, 1_500)
             }
         }
     } ?: ""
-
-    suspend fun extractAllLinks(selector: String = "a[href]"): List<String> {
-        return suspendCancellableCoroutine { continuation ->
-            webView.evaluateJavascript(
-                """
-                (function() {
-                    const links = Array.from(document.querySelectorAll('$selector'))
-                        .map(a => a.href)
-                        .filter(href => href && href.startsWith('http'));
-                    return JSON.stringify(links);
-                })();
-                """.trimIndent()
-            ) { result ->
-                try {
-                    val json = result?.trim('"')?.replace("\\\"", "\"") ?: "[]"
-                    val links = Json.decodeFromString<List<String>>(json)
-                    continuation.resume(links)
-                } catch (e: Exception) {
-                    continuation.resume(emptyList())
-                }
-            }
-        }
-    }
 
     // ── Link extraction ───────────────────────────────────────────────────────
 
@@ -179,7 +159,7 @@ class JavaScriptWebViewEngine(private val existingWebView: WebView? = null) {
             }
         }
 
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
+    // ── Lifecycle ─────────────────────────────────────────────────────────
 
     fun destroy() {
         mainHandler.post {

@@ -6,6 +6,7 @@ import android.os.Looper
 import android.webkit.*
 import com.aggregatorx.app.engine.util.AppContextHolder
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlin.coroutines.resume
 import android.util.Log
@@ -24,6 +25,8 @@ class JavaScriptWebViewEngine(private val existingWebView: WebView? = null) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val TAG = "JSWebViewEngine"
+
+    // ── Core load ─────────────────────────────────────────────────────────
 
     /**
      * Load [url], wait for JS to settle, return full rendered HTML.
@@ -154,35 +157,38 @@ class JavaScriptWebViewEngine(private val existingWebView: WebView? = null) {
                         }
                         var resumed = false
 
-            val js = """
-            (function() {
-                const searchInput = document.querySelector('$searchSelector');
-                if (searchInput) {
-                    searchInput.value = '$query';
-                    searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-                    searchInput.dispatchEvent(new Event('change', { bubbles: true }));
-                }
-                const submitBtn = document.querySelector('$submitSelector');
-                if (submitBtn) {
-                    submitBtn.click();
-                }
-            })();
-            """.trimIndent()
+                val js = """
+                (function() {
+                    const searchInput = document.querySelector('$searchSelector');
+                    if (searchInput) {
+                        searchInput.value = '$query';
+                        searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+                        searchInput.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                    const submitBtn = document.querySelector('$submitSelector');
+                    if (submitBtn) {
+                        submitBtn.click();
+                    }
+                })();
+                """.trimIndent()
 
-            webView.evaluateJavascript(js, null)
+                wv.evaluateJavascript(js, null)
 
-            val startTime = System.currentTimeMillis()
-            var checkRunnable: Runnable? = null
-            
-            checkRunnable = Runnable {
-                webView.evaluateJavascript(
-                    "(function() { return document.querySelectorAll('$resultSelector').length > 0; })();"
-                ) { result ->
-                    val found = result?.contains("true") ?: false
-                    if (found || (System.currentTimeMillis() - startTime) >= (timeoutMs - 1000)) {
-                        webView.evaluateJavascript("document.documentElement.outerHTML") { finalHtml ->
-                            val html = finalHtml?.trim('"')?.replace("\\\"", "\"") ?: ""
-                            safeResume(html)
+                val startTime = System.currentTimeMillis()
+                var checkRunnable: Runnable? = null
+                
+                checkRunnable = Runnable {
+                    wv.evaluateJavascript(
+                        "(function() { return document.querySelectorAll('$resultSelector').length > 0; })();"
+                    ) { result ->
+                        val found = result?.contains("true") ?: false
+                        if (found || (System.currentTimeMillis() - startTime) >= (timeoutMs - 1000)) {
+                            wv.evaluateJavascript("document.documentElement.outerHTML") { finalHtml ->
+                                val html = finalHtml?.trim('"')?.replace("\\\"", "\"") ?: ""
+                                done(html)
+                            }
+                        } else {
+                            wv.postDelayed(checkRunnable!!, 1_500)
                         }
                         wv.postDelayed(check, 1_500)
                     } catch (e: Exception) {
@@ -190,6 +196,7 @@ class JavaScriptWebViewEngine(private val existingWebView: WebView? = null) {
                         if (cont.isActive) cont.resume("")
                     }
                 }
+                wv.postDelayed(checkRunnable!!, 1_500)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error in injectSearchAndWait coroutine", e)
@@ -225,6 +232,8 @@ class JavaScriptWebViewEngine(private val existingWebView: WebView? = null) {
     /**
      * Extract all links with error handling.
      */
+    // ── Link extraction ───────────────────────────────────────────────────────
+
     suspend fun extractAllLinks(selector: String = "a[href]"): List<String> =
         try {
             suspendCancellableCoroutine { cont ->
@@ -271,6 +280,31 @@ class JavaScriptWebViewEngine(private val existingWebView: WebView? = null) {
     /**
      * Cleanup resources.
      */
+    // ── Scroll support ────────────────────────────────────────────────────────
+
+    suspend fun scrollToBottom(iterations: Int = 5) {
+        suspendCancellableCoroutine { cont ->
+            mainHandler.post {
+                val wv = existingWebView ?: run { if (cont.isActive) cont.resume(Unit); return@post }
+                var count = 0
+                val scrollRunnable = object : Runnable {
+                    override fun run() {
+                        if (count < iterations) {
+                            wv.evaluateJavascript("window.scrollBy(0, document.body.scrollHeight);", null)
+                            count++
+                            wv.postDelayed(this, 1_000)
+                        } else {
+                            if (cont.isActive) cont.resume(Unit)
+                        }
+                    }
+                }
+                wv.post(scrollRunnable)
+            }
+        }
+    }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────
+
     fun destroy() {
         mainHandler.post {
             try {

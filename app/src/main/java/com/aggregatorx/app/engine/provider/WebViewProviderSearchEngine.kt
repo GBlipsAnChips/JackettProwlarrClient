@@ -107,7 +107,7 @@ class WebViewProviderSearchEngine(private val context: Context) {
         }
     }
 
-    // ── HTML parsing ──────────────────────────────────────────────────────────
+    // ── HTML parsing ────────────────────────────────────────────────────────
 
     fun parseWebViewResults(html: String, provider: Provider): List<SearchResult> {
         if (html.isBlank()) return emptyList()
@@ -170,7 +170,7 @@ class WebViewProviderSearchEngine(private val context: Context) {
         }
     }
 
-    // ── URL building ──────────────────────────────────────────────────────────
+    // ── URL building ────────────────────────────────────────────────────────
 
     private fun buildSearchUrl(provider: Provider, query: String, page: Int): String {
         val encoded = URLEncoder.encode(query, "UTF-8")

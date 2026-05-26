@@ -12,13 +12,13 @@ object NetworkOptimizer {
                 keepAliveDuration = 5,
                 timeUnit = TimeUnit.MINUTES
             ))
-            .dns { hostname ->
+            .dns(Dns { hostname ->
                 try {
                     java.net.InetAddress.getAllByName(hostname)?.toList() ?: emptyList()
                 } catch (_: Exception) {
                     emptyList()
                 }
-            }
+            })
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .writeTimeout(30, TimeUnit.SECONDS)

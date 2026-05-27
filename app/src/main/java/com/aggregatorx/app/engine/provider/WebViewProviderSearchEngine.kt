@@ -12,6 +12,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 import java.net.URLEncoder
+import javax.inject.Inject
 
 /**
  * WebView-backed provider search engine.
@@ -20,7 +21,10 @@ import java.net.URLEncoder
  * fewer than MIN_RESULTS_THRESHOLD results.  Automatically walks pages until
  * TARGET_RESULTS_PER_PROVIDER results are collected or MAX_PAGES is reached.
  */
-class WebViewProviderSearchEngine(private val context: Context) {
+class WebViewProviderSearchEngine @Inject constructor(
+    private val context: Context,
+    private val webViewFetcher: WebViewFetcher
+) {
 
     companion object {
         private const val TAG = "WebViewProviderSearch"
@@ -43,7 +47,7 @@ class WebViewProviderSearchEngine(private val context: Context) {
             if (allResults.size >= TARGET_RESULTS_PER_PROVIDER) break
             try {
                 val url  = buildSearchUrl(provider, query, page)
-                val html = WebViewFetcher.fetch(url, query, timeoutMs = 18_000L) ?: break
+                val html = webViewFetcher.fetch(url, query, timeoutMs = 18_000L) ?: break
                 val page_results = parseWebViewResults(html, provider)
                 var added = 0
                 page_results.forEach { r -> if (seenUrls.add(r.url)) { allResults.add(r); added++ } }

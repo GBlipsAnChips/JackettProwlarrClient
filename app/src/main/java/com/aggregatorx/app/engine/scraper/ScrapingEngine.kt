@@ -44,7 +44,8 @@ class ScrapingEngine @Inject constructor(
     private val aiDecisionEngine: AIDecisionEngine,
     private val cloudflareBypassEngine: CloudflareBypassEngine,
     private val endpointDiscoveryEngine: EndpointDiscoveryEngine,
-    private val nlpProcessor: NaturalLanguageQueryProcessor
+    private val nlpProcessor: NaturalLanguageQueryProcessor,
+    private val webViewFetcher: WebViewFetcher
 ) {
     @Volatile private var currentProcessedQuery: ProcessedQuery? = null
     private val providerHealthMap = ConcurrentHashMap<String, ProviderHealth>()
@@ -81,7 +82,7 @@ class ScrapingEngine @Inject constructor(
         )
     }
 
-    // ── Cache ─────────────────────────────────────────────────────────────────
+    // ── Cache ────────────────────────────────────────────────────────────
 
     private data class CacheEntry(
         val results: List<ProviderSearchResults>,
@@ -95,7 +96,7 @@ class ScrapingEngine @Inject constructor(
     var cacheResults: Boolean = true
     fun clearCache() { synchronized(resultCache) { resultCache.clear() } }
 
-    // ── Public API ────────────────────────────────────────────────────────────
+    // ── Public API ─────────────────────────────────────────────────────────
 
     /**
      * Search all enabled providers concurrently.
@@ -320,9 +321,9 @@ class ScrapingEngine @Inject constructor(
         try {
             val searchUrl = smartNavigationEngine.findSearchUrl(provider.baseUrl, effectiveQuery)
                 ?: buildFallbackSearchUrl(provider, effectiveQuery, 0)
-            val html = WebViewFetcher.fetch(searchUrl, effectiveQuery, timeoutMs = 18_000L)
+            val html = webViewFetcher.fetch(searchUrl, effectiveQuery, timeoutMs = 18_000L)
             if (html.isNullOrBlank()) return@withContext emptyList()
-            val doc = Jsoup.parse(html, provider.baseUrl)
+            val doc = Jsoup.parse(html, searchUrl)
             extractResultsWithThumbnails(doc, provider, originalQuery)
         } catch (_: Exception) { emptyList() }
     }
@@ -379,7 +380,7 @@ class ScrapingEngine @Inject constructor(
         else null
     }
 
-    // ── Fallback ──────────────────────────────────────────────────────────────
+    // ── Fallback ─────────────────────────────────────────────────────────
 
     private suspend fun tryFallbackScraping(
         provider: Provider,
@@ -584,7 +585,7 @@ class ScrapingEngine @Inject constructor(
         }
     }
 
-    // ── Utilities ─────────────────────────────────────────────────────────────
+    // ── Utilities ─────────────────────────────────────────────────────────
 
     private suspend fun enforceRateLimit(providerId: String) {
         val last = lastRequestTime[providerId] ?: 0L

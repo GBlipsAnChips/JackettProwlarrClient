@@ -1,6 +1,7 @@
 package com.aggregatorx.app.engine.network
 
 import okhttp3.*
+import java.net.InetAddress
 import java.util.concurrent.TimeUnit
 
 object NetworkOptimizer {
@@ -12,11 +13,13 @@ object NetworkOptimizer {
                 keepAliveDuration = 5,
                 timeUnit = TimeUnit.MINUTES
             ))
-            .dns(Dns { hostname ->
-                try {
-                    java.net.InetAddress.getAllByName(hostname)?.toList() ?: emptyList()
-                } catch (_: Exception) {
-                    emptyList()
+            .dns(object : Dns {
+                override fun lookup(hostname: String): List<InetAddress> {
+                    return try {
+                        java.net.InetAddress.getAllByName(hostname)?.toList() ?: emptyList()
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
                 }
             })
             .connectTimeout(30, TimeUnit.SECONDS)

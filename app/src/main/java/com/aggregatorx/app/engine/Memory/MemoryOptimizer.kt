@@ -3,6 +3,7 @@ package com.aggregatorx.app.engine.memory
 import android.app.ActivityManager
 import android.content.ComponentCallbacks2
 import android.content.Context
+import android.content.res.Configuration
 import androidx.lifecycle.DefaultLifecycleObserver
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
@@ -37,7 +38,7 @@ class MemoryOptimizer @Inject constructor(
         val memInfo = ActivityManager.MemoryInfo()
         activityManager.getMemoryInfo(memInfo)
         
-        val totalMemory = memInfo.totalDeviceMemory
+        val totalMemory = memInfo.totalMem
         return MemoryInfo(
             totalMemory = totalMemory,
             availableMemory = memInfo.availMem,
@@ -64,6 +65,10 @@ class MemoryOptimizer @Inject constructor(
                 }
             }
         }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        // Handle configuration changes if needed
     }
 
     data class MemoryInfo(
